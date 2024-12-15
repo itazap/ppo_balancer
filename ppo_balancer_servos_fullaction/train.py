@@ -17,7 +17,8 @@ import gymnasium
 import numpy as np
 import stable_baselines3
 import upkie.envs
-from envs import make_ppo_balancer_env
+from upkie.envs import UpkieGroundVelocity, UpkieServos
+from envs import make_ppo_balancer_env, make_ppo_balancer_env_servos
 from rules_python.python.runfiles import runfiles
 from settings import EnvSettings, PPOSettings, TrainingSettings
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
@@ -30,6 +31,28 @@ from torch import nn
 from upkie.utils.spdlog import logging
 
 upkie.envs.register()
+
+class CustomUpkieServos(UpkieServos):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    
+    def detect_fall(self, spine_observation: dict) -> bool:
+        pitch = spine_observation["base_orientation"]["pitch"]
+        joint_angles = [abs(pitch)]
+        for joint_name, joint_data in spine_observation["servo"].items():
+            if "knee" in joint_name or "hip" in joint_name:
+                joint_angles.append(abs(joint_data["position"]))
+
+        if np.any(np.array(joint_angles) > 1.0):
+            logging.warning(
+                "ITA Fall detected (pitch=%.2f rad, fall_pitch=%.2f rad)",
+                abs(pitch),
+                self.fall_pitch,
+            )
+            return True
+        return False
+    
 
 
 def parse_command_line_arguments() -> argparse.Namespace:
@@ -151,6 +174,165 @@ def get_bullet_argv(shm_name: str, show: bool) -> List[str]:
     return bullet_argv
 
 
+###################################################################################################################
+
+class UpkieServosWrapper(gymnasium.Wrapper):
+    """!
+    Wrapper for the UpkieServos environment that converts actions 
+    and observations to NumPy ndarrays.
+
+    This wrapper simplifies the interaction with the UpkieServos environment
+    by converting the dictionary-based actions and observations into 
+    flattened NumPy ndarrays. This can be useful for compatibility with 
+    algorithms that expect ndarray inputs.
+    """
+
+    def __init__(self, env: gymnasium.Env):
+        super().__init__(env)
+
+        # Determine the size of the flattened action and observation arrays
+        self.action_dim = 0
+        for joint_space in self.env.action_space.spaces.values():
+            for action_type_space in joint_space.spaces.values():
+                self.action_dim += action_type_space.shape[0]
+
+        self.observation_dim = 0
+        for joint_space in self.env.observation_space.spaces.values():
+            for obs_type_space in joint_space.spaces.values():
+                self.observation_dim += obs_type_space.shape[0]
+
+        # Define the new action and observation spaces
+        self.action_space = gymnasium.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(self.action_dim,), dtype=np.float64
+        )
+        self.observation_space = gymnasium.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.observation_dim,),
+            dtype=np.float64,
+        )
+
+
+    def reset(self, seed=None, options=None):
+        obs_dict, info = self.env.reset(seed=seed, options=options)
+        return self._flatten_observation(obs_dict), info
+
+
+    def step(self, action: np.ndarray):
+        """!
+        Take a step in the environment using an ndarray action.
+
+        Args:
+            action: The action to take as an ndarray.
+
+        Returns:
+            A tuple containing the next observation as an ndarray,
+            the reward, a boolean indicating if the episode is done,
+            a boolean indicating if the episode is truncated,
+            and a dictionary containing extra information.
+        """
+        action_dict = self._unflatten_action(action)
+        obs_dict, reward, terminated, truncated, info = self.env.step(
+            action_dict
+        )
+       # print(f"====================\nobs_dict: {obs_dict}\n====================")
+        obs_dict_og = obs_dict.copy()
+        obs_dict["pitch"] = info["spine_observation"]["base_orientation"]["pitch"]
+        obs_dict["velocity"] = info["spine_observation"]["wheel_odometry"]["velocity"]
+        obs_dict["pitch_vel"] = np.linalg.norm(info["spine_observation"]["imu"]["angular_velocity"])
+        reward = self.get_reward(obs_dict, action_dict, pos = info["spine_observation"]["wheel_odometry"]["position"], height = info["spine_observation"]["sim"]["base"]["position"][2])
+
+        if abs(obs_dict["left_knee"]["position"]) > 2:
+            terminated = True
+        
+        
+        return (
+            self._flatten_observation(obs_dict_og),
+            reward,
+            terminated,
+            truncated,
+            info,
+        )
+
+    
+    def _flatten_observation(self, obs_dict: dict) -> np.ndarray:
+        flat_obs = []
+        for joint_obs in obs_dict.values():
+            for obs_value in joint_obs.values():
+                if np.isnan(obs_value):
+                    obs_value = 0
+                flat_obs.append(np.array(obs_value))
+        return np.concatenate(flat_obs)
+    
+    def _unflatten_action(self, action_ndarray: np.ndarray) -> dict:
+        """!
+        Unflatten the ndarray action into a dictionary-based action.
+
+        Args:
+            action_ndarray: The action as an ndarray.
+
+        Returns:
+            The unflattened action as a dictionary.
+        """
+        action_dict = {}
+        i = 0
+        for joint_name, joint_space in self.env.action_space.spaces.items():
+            action_dict[joint_name] = {}
+            for action_key in joint_space.spaces:
+                action_len = joint_space[action_key].shape[0]
+                if action_key == "maximum_torque":
+                    continue
+                action_dict[joint_name][action_key] = action_ndarray[i : i + action_len][0]
+                i += action_len
+
+        return action_dict
+    
+    # Override the method that calculates the reward.
+    def get_reward(self, observation: dict, action: dict, pos: float, height: float) -> float:
+        """!
+        Get reward from observation and action.
+
+        \param observation Environment observation.
+        \param action Environment action.
+        \return Reward.
+        """
+        estimated_pitch = observation["pitch"]
+        estimated_ground_position = pos
+        estimated_ground_velocity = observation["velocity"]
+        estimated_angular_velocity = observation["pitch_vel"]
+
+
+        tip_height = 0.58  # [m]  
+        tip_position = estimated_ground_position + tip_height * np.sin(estimated_pitch)
+        tip_velocity = estimated_ground_velocity + tip_height * estimated_angular_velocity * np.cos(estimated_pitch)
+
+        std_position = 0.05  # [m]
+        position_reward = np.exp(-((tip_position / std_position) ** 2))
+        velocity_penalty = -abs(tip_velocity)
+
+        position_weight = 0.5 
+        velocity_weight = 0.1
+
+
+        return  + 0.5 + position_weight * position_reward + velocity_weight * velocity_penalty 
+
+    def get_reward_basic(self, observation: dict, action: dict) -> float:
+        reward = 0.0
+
+        # Penalize large angles (deviation from upright position)
+        for joint_name, joint_data in observation.items():
+            position = joint_data.get("position", 0.0)
+            reward -= abs(position)  # Penalize deviations from 0 rad
+
+        # Penalize high velocities
+        for joint_name, joint_data in observation.items():
+            velocity = joint_data.get("velocity", 0.0)
+            reward -= abs(velocity)  # Penalize high velocities
+
+        return reward
+   
+###########################################################################
+
 def init_env(
     max_episode_duration: float,
     show: bool,
@@ -176,30 +358,26 @@ def init_env(
 
         # parent process: trainer
         agent_frequency = env_settings.agent_frequency
-        velocity_env = gymnasium.make(
-            env_settings.env_id,
-            max_episode_steps=int(max_episode_duration * agent_frequency),
+        velocity_env = CustomUpkieServos(
             frequency=agent_frequency,
             regulate_frequency=False,
-            reward=upkie.envs.rewards.WheeledInvertedPendulumReward(
-                position_weight=env_settings.reward["position_weight"],
-                velocity_weight=env_settings.reward["velocity_weight"],
-            ),
             shm_name=shm_name,
             spine_config=env_settings.spine_config,
-            max_ground_velocity=env_settings.max_ground_velocity,
         )
-        velocity_env.reset(seed=seed)
-        velocity_env._prepatch_close = velocity_env.close
+
+        # Wrap the environment with the UpkieServosWrapper
+        velocity_env_flat = UpkieServosWrapper(velocity_env)
+        velocity_env_flat.reset(seed=seed)
+        velocity_env_flat._prepatch_close = velocity_env_flat.close
 
         def close_monkeypatch():
             logging.info(f"Terminating spine {shm_name} with {pid=}...")
             os.kill(pid, signal.SIGINT)  # interrupt spine child process
             os.waitpid(pid, 0)  # wait for spine to terminate
-            velocity_env._prepatch_close()
+            velocity_env_flat._prepatch_close()
 
-        velocity_env.close = close_monkeypatch
-        env = make_ppo_balancer_env(velocity_env, env_settings, training=True)
+        velocity_env_flat.close = close_monkeypatch
+        env = make_ppo_balancer_env_servos(velocity_env_flat, env_settings, training=True)
         return Monitor(env)
 
     set_random_seed(seed)

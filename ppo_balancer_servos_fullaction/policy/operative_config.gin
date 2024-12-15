@@ -4,13 +4,13 @@ import settings
 # ==============================================================================
 EnvSettings.accel_penalty = 0.0
 EnvSettings.action_lpf = (0.05, 0.15)
-EnvSettings.action_noise = [0.05]
+EnvSettings.action_noise = [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+EnvSettings.observation_noise = [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01]
 EnvSettings.agent_frequency = 200
-EnvSettings.env_id = 'UpkieGroundVelocity-v3'
+EnvSettings.env_id = "UpkieServos-v4"
 EnvSettings.history_size = 10
 EnvSettings.max_ground_accel = 10.0
-EnvSettings.max_ground_velocity = 1.0
-EnvSettings.observation_noise = [0.01, 0.01, 0.01, 0.01]
+EnvSettings.max_ground_velocity = 10.0
 EnvSettings.reward = {'position': 1.0, 'velocity': 0.1}
 EnvSettings.spine_config = {'bullet': {'torque_control': {'kd': 1.0}}}
 EnvSettings.spine_frequency = 1000
@@ -36,7 +36,7 @@ PPOSettings.vf_coef = 0.5
 
 # Parameters for TrainingSettings:
 # ==============================================================================
-TrainingSettings.init_rand = {'omega_y': 0.1, 'pitch': 0.25, 'v_x': 0.1}
+TrainingSettings.init_rand = {'omega_y': 0.0, 'pitch': 0.0, 'v_x': 0.0}
 TrainingSettings.max_episode_duration = 10.0
 TrainingSettings.return_horizon = 5.0
 TrainingSettings.total_timesteps = 2000000
