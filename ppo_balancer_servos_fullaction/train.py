@@ -330,7 +330,179 @@ class UpkieServosWrapper(gymnasium.Wrapper):
             reward -= abs(velocity)  # Penalize high velocities
 
         return reward
-   
+
+
+###########################################################################
+
+
+class WheeledInvertedPendulumReward:
+    r"""!
+    Weights of the position and velocity terms in rewards.
+    """
+
+    ## \var position_weight
+    ## Weight of the position term.
+    position_weight: float
+
+    ## \var velocity_weight
+    ## Weight of the velocity term.
+    velocity_weight: float
+
+    def __init__(
+        self, position_weight: float = 1.0, velocity_weight: float = 1.0
+    ):
+        r"""!
+        Initialize with reward weights.
+
+        \param position Weight of the position term.
+        \param velocity Weight of the velocity term.
+        """
+        self.position_weight = position_weight
+        self.velocity_weight = velocity_weight
+
+    def __call__(
+        self,
+        pitch: float,
+        ground_position: float,
+        angular_velocity: float,
+        ground_velocity: float,
+    ) -> float:
+        r"""!
+        Get reward for a given state.
+
+        \param[in] pitch Pitch angle of the rotation from base to world, in
+            [rad].
+        \param[in] ground_position Position on the ground, in [m].
+        \param[in] angular_velocity Angular velocity of the rotation from base
+            to world, in [rad] / [s].
+        \p[aram[in] ground_velocity Ground velocity, in [m] / [s].
+        \return Reward.
+        """
+        tip_height = 0.58  # [m]
+        tip_position = ground_position + tip_height * np.sin(pitch)
+        tip_velocity = (
+            ground_velocity + tip_height * angular_velocity * np.cos(pitch)
+        )
+
+        std_position = 0.05  # [m]
+        position_reward = np.exp(-((tip_position / std_position) ** 2))
+        velocity_penalty = -abs(tip_velocity)
+
+        pitch_weight = 0.1
+        angular_velocity_weight = 0.1
+
+
+        # 1. Add a penalty for large pitch angles
+        pitch_penalty = -np.abs(pitch)
+
+        # 2. Add a penalty for high angular velocities (if not already present)
+        angular_velocity_penalty = -np.abs(angular_velocity)  
+
+        # 3. (Optional) Add a penalty for high ground velocities
+        ground_velocity_penalty = -np.abs(ground_velocity) * 0.0
+
+        # 4. Combine the penalties with the existing reward
+        return (0.5
+            + self.position_weight * position_reward
+            + self.velocity_weight * velocity_penalty
+            + pitch_penalty * pitch_weight # Add the pitch penalty
+            + angular_velocity_penalty  * angular_velocity_weight # Add the angular velocity penalty
+            + ground_velocity_penalty  # (Optional) Add the ground velocity penalty
+        )
+
+
+
+###########################################################################
+
+
+class UpkieGroundVelocityWrapper(gymnasium.Wrapper):
+
+    def __init__(self, env: gymnasium.Env):
+        """!
+        Initialize the wrapper.
+
+        Args:
+            env: The UpkieServos environment to wrap.
+        """
+        super().__init__(env)
+
+        self.torso_force_in_world = np.zeros(3)
+        self.torso_force_in_world[0] = 0
+        self.bullet_action = {
+            "external_forces": {
+                "torso": {
+                    "force": self.torso_force_in_world,
+                    "local": False,
+                }
+            }
+        }
+
+        self.timestep = 0
+        self.total_timestep = 0
+    
+    def reset(self, seed=None, options=None):
+        """!
+        Reset the environment and return the observation as an ndarray.
+
+        Returns:
+            The initial observation as an ndarray.
+        """
+        obs, info = self.env.reset(seed=seed, options=options)
+        sign = np.random.choice(np.array([-1., 1.]))
+
+        self.torso_force_in_world[0] = self.scheduler(self.total_timestep) * sign
+        self.bullet_action = {
+            "external_forces": {
+                "torso": {
+                    "force": self.torso_force_in_world,
+                    "local": False,
+                }
+            }
+        }
+        
+        self.timestep = 0
+        
+        return obs, info
+
+    
+    def step(self, action: np.ndarray):
+ 
+        if self.timestep % 800 < 400 and self.timestep % 800 >= 200:
+            sign = np.random.choice(np.array([-1., 1.]))
+            self.torso_force_in_world[0] = np.random.uniform(0, self.scheduler(self.total_timestep) * sign)
+            self.bullet_action = {
+                "external_forces": {
+                    "torso": {
+                        "force": self.torso_force_in_world,
+                        "local": False,
+                    }
+                }
+            }
+            self.env.unwrapped.bullet_extra(self.bullet_action)  # call before env.step
+
+        obs, reward, terminated, truncated, info = self.env.step(
+            action
+        )
+
+        self.timestep += 1
+        self.total_timestep += 1
+
+        return obs, reward, terminated, truncated, info
+
+    
+    def scheduler(self, t):
+        if t < 1e5:
+            return 0
+        elif t < 1e6 and t > 1e5:
+            return 16 * (1 / (np.exp(t / 1e6) + 1) - 0.5)
+        else:
+            return 16
+
+
+
+###################################################################################
+
+
 ###########################################################################
 
 def init_env(
